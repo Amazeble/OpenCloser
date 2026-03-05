@@ -150,6 +150,17 @@ export const PLATFORM_PRESETS: PlatformPreset[] = [
     key_placeholder: "your-aihubmix-key",
     category: "proxy",
   },
+  {
+    id: "zenmux",
+    name: "ZenMux",
+    base_url: "https://zenmux.ai/api/anthropic",
+    auth_env_var: "ANTHROPIC_AUTH_TOKEN",
+    description: "Multi-model API gateway",
+    key_placeholder: "sk-ss-v1-xxx",
+    category: "proxy",
+    extra_env: { API_TIMEOUT_MS: "30000000" },
+    docs_url: "https://zenmux.ai/docs/best-practices/claude-code.html",
+  },
 
   // ── Local Proxy ──
   {

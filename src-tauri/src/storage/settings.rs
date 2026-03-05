@@ -177,6 +177,16 @@ fn known_provider_defaults(pid: &str) -> Option<ProviderDefaults> {
             key_optional: false,
             auth_env_var: None,
         }),
+        "zenmux" => Some(ProviderDefaults {
+            base_url: Some("https://zenmux.ai/api/anthropic"),
+            models: None,
+            extra_env: Some(HashMap::from([(
+                "API_TIMEOUT_MS".to_string(),
+                "30000000".to_string(),
+            )])),
+            key_optional: false,
+            auth_env_var: None,
+        }),
         "vercel" => Some(ProviderDefaults {
             base_url: Some("https://ai-gateway.vercel.sh"),
             models: None,
