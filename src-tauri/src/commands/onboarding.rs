@@ -356,7 +356,7 @@ pub(crate) async fn check_cli_oauth() -> (bool, Option<String>) {
 }
 
 /// Get display name for a platform preset ID.
-fn preset_name(pid: &str) -> String {
+pub(crate) fn preset_name(pid: &str) -> String {
     // Known preset names (mirrors frontend PLATFORM_PRESETS)
     match pid {
         "anthropic" => "Anthropic",
@@ -364,9 +364,11 @@ fn preset_name(pid: &str) -> String {
         "kimi" => "Kimi (Moonshot)",
         "kimi-coding" => "Kimi For Coding",
         "zhipu" => "Zhipu (智谱)",
+        "zhipu-intl" => "Zhipu (智谱 Intl)",
         "bailian" => "Bailian (百炼)",
         "doubao" => "DouBao (豆包)",
         "minimax" => "MiniMax",
+        "minimax-cn" => "MiniMax (China)",
         "mimo" => "Xiaomi MiMo (小米)",
         "vercel" => "Vercel AI Gateway",
         "openrouter" => "OpenRouter",
@@ -374,6 +376,9 @@ fn preset_name(pid: &str) -> String {
         "modelscope" => "ModelScope (魔搭)",
         "aihubmix" => "AiHubMix",
         "ollama" => "Ollama",
+        "ccswitch" => "CC Switch",
+        "ccr" => "Claude Code Router",
+        "zenmux" => "ZenMux",
         "custom" => "Custom",
         _ => return pid.to_string(),
     }
@@ -547,5 +552,25 @@ async fn check_npm_available() -> bool {
             major >= 18
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_name_key_platforms() {
+        // Guard against drift from frontend platform-presets.ts
+        assert_eq!(preset_name("ccswitch"), "CC Switch");
+        assert_eq!(preset_name("ccr"), "Claude Code Router");
+        assert_eq!(preset_name("zhipu-intl"), "Zhipu (智谱 Intl)");
+        assert_eq!(preset_name("minimax-cn"), "MiniMax (China)");
+        assert_eq!(preset_name("zenmux"), "ZenMux");
+        // Existing mappings
+        assert_eq!(preset_name("anthropic"), "Anthropic");
+        assert_eq!(preset_name("ollama"), "Ollama");
+        // Unknown falls back to pid
+        assert_eq!(preset_name("unknown-xyz"), "unknown-xyz");
     }
 }

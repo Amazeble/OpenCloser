@@ -190,6 +190,99 @@ fn make_placeholder_auth(
     }
 }
 
+/// Check whether a URL points to a local address (localhost, 127.x.x.x, ::1, 0.0.0.0).
+fn is_local_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host == "localhost" {
+        return true;
+    }
+    // Parse as IP and check loopback/unspecified
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback() || ip.is_unspecified();
+    }
+    // Handle bracketed IPv6 like [::1]
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return ip.is_loopback() || ip.is_unspecified();
+    }
+    false
+}
+
+/// Preflight reachability check for a provider's base_url.
+/// Sends HEAD to `{base_url}/v1/models` — any HTTP response (even 401/403/405)
+/// means the service is online. Only connection failure/timeout returns Err.
+async fn preflight_check_base_url(
+    base_url: Option<&str>,
+    platform_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(url) = base_url else {
+        log::debug!("[session] preflight: no base_url, skipping");
+        return Ok(());
+    };
+
+    let is_local = is_local_url(url);
+    let timeout = if is_local {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(3)
+    };
+
+    let check_url = format!("{}/v1/models", url.trim_end_matches('/'));
+    log::debug!(
+        "[session] preflight: checking {} (local={}, timeout={:?})",
+        check_url,
+        is_local,
+        timeout
+    );
+
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if is_local {
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    match client.head(&check_url).send().await {
+        Ok(resp) => {
+            log::debug!(
+                "[session] preflight: {} responded with status {}",
+                url,
+                resp.status()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let display_name = platform_id
+                .map(super::onboarding::preset_name)
+                .unwrap_or_else(|| "Provider".to_string());
+
+            let suggestion = if is_local {
+                format!(
+                    "Make sure {} is running and listening on {}",
+                    display_name, url
+                )
+            } else {
+                format!(
+                    "Check your network connection and verify {} is accessible",
+                    url
+                )
+            };
+
+            log::warn!("[session] preflight: {} unreachable: {}", url, e);
+            Err(format!(
+                "{} is unreachable ({}). {}",
+                display_name, url, suggestion
+            ))
+        }
+    }
+}
+
 /// Resolve auth env using per-session platform_id.
 /// Looks up the credential from `settings.platform_credentials` by platform_id,
 /// then returns ResolvedAuth matching the credential's auth_env_var.
@@ -413,6 +506,20 @@ pub async fn start_session(
     adapter::validate_session_params(&adapter_settings, &session_mode)?;
 
     let is_new = matches!(session_mode, SessionMode::New);
+
+    // Preflight: check base_url reachability
+    // Skip for SSH remote — reachability depends on remote host's network
+    if remote.is_none() {
+        if let Err(e) = preflight_check_base_url(resolved.base_url.as_deref(), effective_pid).await
+        {
+            // Only mark as Failed for new runs still in Pending — don't overwrite history
+            if is_new && meta.status == RunStatus::Pending {
+                storage::runs::update_status(&run_id, RunStatus::Failed, None, Some(e.clone()))
+                    .ok();
+            }
+            return Err(e);
+        }
+    }
 
     // 4. Emit RunState(spawning) — UserMessage now handled by actor
     let spawning_event = BusEvent::RunState {
@@ -850,10 +957,7 @@ pub async fn approve_session_tool(
         );
     }
 
-    // 3. Stop current actor
-    stop_actor(sessions.inner(), &run_id).await?;
-
-    // 4. Resolve remote + extract fields before consuming meta (audit #3)
+    // 3. Resolve remote + auth BEFORE stopping actor (preflight failure keeps old actor alive)
     let remote = resolve_remote_host(&meta)?;
     let effective_cwd = meta.remote_cwd.clone().unwrap_or_else(|| meta.cwd.clone());
     let prompt = meta.prompt.clone();
@@ -862,13 +966,20 @@ pub async fn approve_session_tool(
         .clone()
         .ok_or_else(|| "No session_id for continue".to_string())?;
 
-    // 5. Rebuild adapter settings (now includes new tool) + resolve auth env
     let refreshed_agent = storage::settings::get_agent_settings(&meta.agent);
     let user = storage::settings::get_user_settings();
     let adapter = adapter::build_adapter_settings(&refreshed_agent, &user, None);
     let resolved = resolve_auth_env_for_platform(&remote, &user, meta.platform_id.as_deref());
 
-    // 7. Emit spawning
+    // 4. Preflight — before killing old actor so session can recover on failure
+    if remote.is_none() {
+        preflight_check_base_url(resolved.base_url.as_deref(), meta.platform_id.as_deref()).await?;
+    }
+
+    // 5. Now safe to stop current actor
+    stop_actor(sessions.inner(), &run_id).await?;
+
+    // 6. Emit spawning
     let spawning_event = BusEvent::RunState {
         run_id: run_id.clone(),
         state: "spawning".to_string(),
@@ -1448,5 +1559,112 @@ mod tests {
         assert_eq!(resolved.auth_token.as_deref(), Some("PROXY_MANAGED"));
         assert_eq!(resolved.base_url.as_deref(), Some("http://127.0.0.1:3456"));
         assert_eq!(resolved.default_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    // ── is_local_url tests ──
+
+    #[test]
+    fn is_local_url_loopback_variants() {
+        assert!(is_local_url("http://127.0.0.1:15721"));
+        assert!(is_local_url("http://127.0.99.1:8080"));
+        assert!(is_local_url("http://localhost:11434"));
+        assert!(is_local_url("http://[::1]:8080"));
+        assert!(is_local_url("http://0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn is_local_url_remote_not_matched() {
+        assert!(!is_local_url("https://api.deepseek.com"));
+        assert!(!is_local_url("https://127.example.com"));
+        assert!(!is_local_url("https://example.com/path?host=127.0.0.1"));
+        assert!(!is_local_url("not-a-url"));
+    }
+
+    // ── preflight_check_base_url tests ──
+
+    #[tokio::test]
+    async fn preflight_none_url_skips() {
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let result = preflight_check_base_url(None, None).await;
+            assert!(result.is_ok());
+        });
+        timeout.await.expect("test timed out");
+    }
+
+    #[tokio::test]
+    async fn preflight_unreachable_returns_error() {
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // RFC 5737 TEST-NET — guaranteed non-routable
+            let result =
+                preflight_check_base_url(Some("http://192.0.2.1:1"), Some("ccswitch")).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("unreachable"), "error: {}", err);
+            assert!(err.contains("CC Switch"), "error: {}", err);
+        });
+        timeout.await.expect("test timed out");
+    }
+
+    #[tokio::test]
+    async fn preflight_reachable_200_is_ok() {
+        use tokio::io::AsyncWriteExt;
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+            let url = format!("http://127.0.0.1:{}", port);
+            let result = preflight_check_base_url(Some(&url), Some("ccswitch")).await;
+            assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        });
+        timeout.await.expect("test timed out");
+    }
+
+    #[tokio::test]
+    async fn preflight_reachable_401_is_ok() {
+        use tokio::io::AsyncWriteExt;
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+            let url = format!("http://127.0.0.1:{}", port);
+            let result = preflight_check_base_url(Some(&url), Some("deepseek")).await;
+            assert!(result.is_ok(), "401 should be treated as reachable");
+        });
+        timeout.await.expect("test timed out");
+    }
+
+    #[tokio::test]
+    async fn preflight_reachable_405_is_ok() {
+        use tokio::io::AsyncWriteExt;
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+            let url = format!("http://127.0.0.1:{}", port);
+            let result = preflight_check_base_url(Some(&url), Some("ollama")).await;
+            assert!(result.is_ok(), "405 should be treated as reachable");
+        });
+        timeout.await.expect("test timed out");
     }
 }
