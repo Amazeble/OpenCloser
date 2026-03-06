@@ -469,7 +469,12 @@ pub async fn start_session(
     // 2b. Resolve remote host from RunMeta (audit #2: single truth source)
     let remote = resolve_remote_host(&meta)?;
     // Use per-session platform_id: prefer IPC param, fallback to RunMeta's saved platform_id
-    let effective_pid = platform_id.as_deref().or(meta.platform_id.as_deref());
+    // CLI Auth mode: ignore platform_id — CLI manages its own connection
+    let effective_pid = if user_settings.auth_mode == "cli" {
+        None
+    } else {
+        platform_id.as_deref().or(meta.platform_id.as_deref())
+    };
     let resolved = resolve_auth_env_for_platform(&remote, &user_settings, effective_pid);
     if remote.is_some() {
         log::debug!(
@@ -969,11 +974,17 @@ pub async fn approve_session_tool(
     let refreshed_agent = storage::settings::get_agent_settings(&meta.agent);
     let user = storage::settings::get_user_settings();
     let adapter = adapter::build_adapter_settings(&refreshed_agent, &user, None);
-    let resolved = resolve_auth_env_for_platform(&remote, &user, meta.platform_id.as_deref());
+    // CLI Auth mode: ignore platform_id — CLI manages its own connection
+    let effective_pid = if user.auth_mode == "cli" {
+        None
+    } else {
+        meta.platform_id.as_deref()
+    };
+    let resolved = resolve_auth_env_for_platform(&remote, &user, effective_pid);
 
     // 4. Preflight — before killing old actor so session can recover on failure
     if remote.is_none() {
-        preflight_check_base_url(resolved.base_url.as_deref(), meta.platform_id.as_deref()).await?;
+        preflight_check_base_url(resolved.base_url.as_deref(), effective_pid).await?;
     }
 
     // 5. Now safe to stop current actor

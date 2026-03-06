@@ -802,8 +802,10 @@
         }
       }
       // Initialize per-session platform from global active
+      // Only use active_platform_id in App API Key mode; CLI Auth manages its own connection
       if (!store.platformId) {
-        store.platformId = settings.active_platform_id ?? "anthropic";
+        store.platformId =
+          settings.auth_mode === "api" ? (settings.active_platform_id ?? "anthropic") : "anthropic";
       }
       // Initialize model: for third-party platforms, use credential > preset default model
       // Only for new sessions — if runId is set, loadRun will handle model restoration.
