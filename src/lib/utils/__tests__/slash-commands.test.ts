@@ -13,6 +13,7 @@ import {
   classifyCloseReason,
   getCommandCategory,
   groupSlashCommands,
+  extractSlashQuery,
   VIRTUAL_COMMANDS,
   QUICK_ACTION_NAMES,
   CONTEXT_CLEARED_MARKER,
@@ -1133,5 +1134,84 @@ describe("/loop command", () => {
 
   it('getCommandCategory returns "session" for loop', () => {
     expect(getCommandCategory("loop")).toBe("session");
+  });
+});
+
+// ── Chinese Dun (、) Trigger Support ──
+
+describe("extractSlashQuery", () => {
+  it("extracts query from / prefix", () => {
+    expect(extractSlashQuery("/compact")).toBe("compact");
+  });
+
+  it("extracts query from 、 prefix", () => {
+    expect(extractSlashQuery("、compact")).toBe("compact");
+  });
+
+  it("returns empty string for bare trigger", () => {
+    expect(extractSlashQuery("/")).toBe("");
+    expect(extractSlashQuery("、")).toBe("");
+  });
+
+  it("returns null for non-trigger input", () => {
+    expect(extractSlashQuery("hello")).toBeNull();
+    expect(extractSlashQuery("#compact")).toBeNull();
+    expect(extractSlashQuery("")).toBeNull();
+  });
+
+  it("returns null when text follows by space (breaks match)", () => {
+    expect(extractSlashQuery("、compact arg")).toBeNull();
+    expect(extractSlashQuery("/compact arg")).toBeNull();
+  });
+
+  it("returns null when text precedes trigger (IME scenario)", () => {
+    // After IME completes "nihao" → "你好" and user types "、",
+    // input is "你好、" which should NOT open the slash menu.
+    expect(extractSlashQuery("你好、")).toBeNull();
+  });
+
+  it("supports hyphenated command names", () => {
+    expect(extractSlashQuery("、allowed-tools")).toBe("allowed-tools");
+    expect(extractSlashQuery("/allowed-tools")).toBe("allowed-tools");
+  });
+});
+
+describe("Chinese dun trigger — end-to-end filter path", () => {
+  const commands: CliCommand[] = [
+    { name: "compact", description: "Compact", aliases: ["c"] },
+    { name: "config", description: "Config", aliases: [] },
+    { name: "model", description: "Model", aliases: ["m"] },
+  ];
+
+  it("filters by query extracted from 、co", () => {
+    const query = extractSlashQuery("、co");
+    expect(query).not.toBeNull();
+    expect(filterSlashCommands(commands, query!).map((c) => c.name)).toEqual(["compact", "config"]);
+  });
+
+  it("produces identical filter results for /co and 、co", () => {
+    const slashQuery = extractSlashQuery("/co")!;
+    const dunQuery = extractSlashQuery("、co")!;
+    expect(filterSlashCommands(commands, slashQuery)).toEqual(
+      filterSlashCommands(commands, dunQuery),
+    );
+  });
+
+  // null vs empty-string semantics — drives grouped vs flat mode in PromptInput.
+  // null = no trigger → menu closed; "" = bare trigger → grouped view.
+  it("distinguishes null (no trigger) from empty string (bare trigger)", () => {
+    expect(extractSlashQuery("hello")).toBeNull();
+    expect(extractSlashQuery("/")).toBe("");
+    expect(extractSlashQuery("、")).toBe("");
+  });
+
+  it("bare 、 yields empty query, driving grouped view (parity with /)", () => {
+    // slashGroups in PromptInput.svelte only builds when slashQuery === "".
+    // Both bare triggers must produce "" (not null) to enter grouped mode.
+    const slashEmpty = extractSlashQuery("/");
+    const dunEmpty = extractSlashQuery("、");
+    expect(slashEmpty).toBe("");
+    expect(dunEmpty).toBe("");
+    expect(slashEmpty).toBe(dunEmpty);
   });
 });
