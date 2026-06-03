@@ -22,5 +22,9 @@ export {
   getCliVersionInfo_cached,
   isCliVersionLoading,
   updateInstalledVersion,
+  getCodexVersion,
+  getCodexModels,
+  getCodexDefaultModel,
+  loadCodexModels,
 } from "./cli-info.svelte";
 export type { CliVersionInfo } from "./cli-info.svelte";

@@ -76,6 +76,7 @@
     sessionAlive = false,
     canResume = false,
     useStreamSession = false,
+    slashCommandMenu = false,
     isRemote = false,
     cliCommands = [],
     models = [],
@@ -119,6 +120,7 @@
     sessionAlive?: boolean;
     canResume?: boolean;
     useStreamSession?: boolean;
+    slashCommandMenu?: boolean;
     isRemote?: boolean;
     cliCommands?: CliCommand[];
     models?: CliModelInfo[];
@@ -388,15 +390,15 @@
   let slashSubSelectedIndex = $state(0);
   let activeSlashCmd: CliCommand | null = $state(null);
 
-  let slashEnabled = $derived(agent === "claude" && !!useStreamSession);
+  let slashEnabled = $derived(!!slashCommandMenu);
   let slashBtnEl: HTMLButtonElement | undefined = $state();
   let savedInputForSlash = $state("");
 
   // ── Chinese IME support ──
   let isComposing = $state(false);
 
-  let allCommands = $derived(mergeWithVirtual(cliCommands ?? []));
-  let quickActions = $derived(getQuickActions(allCommands));
+  let allCommands = $derived(mergeWithVirtual(cliCommands ?? [], agent));
+  let quickActions = $derived(getQuickActions(allCommands, agent));
   let skillNameSet = $derived(new Set(availableSkills));
 
   let slashQuery = $derived.by(() => {
@@ -1127,14 +1129,16 @@
 
     // Virtual slash command check — based on raw textarea, not paste blocks
     if (typed) {
-      const virtual = parseVirtualAction(typed);
+      const virtual = parseVirtualAction(typed, agent);
       if (virtual) {
         dbg("slash", `virtual:${virtual.name}`, { args: virtual.args });
-        if (virtual.name === "model" && virtual.args && onModelSwitch) {
-          inputText = "";
-          if (textareaEl) textareaEl.style.height = "auto";
-          onModelSwitch(virtual.args);
-          return; // pastedBlocks preserved
+        if (virtual.name === "model" && virtual.args) {
+          if (onModelSwitch) {
+            inputText = "";
+            if (textareaEl) textareaEl.style.height = "auto";
+            onModelSwitch(virtual.args);
+          }
+          return; // Always consume /model command, even without handler
         }
         // Navigation virtual commands (e.g. /config → /settings?tab=cli-config)
         const vDef = VIRTUAL_COMMANDS.find((v) => v.name === virtual.name);
@@ -2113,7 +2117,10 @@
           </svg>
           {t("permissions_rules")}
         </button>
-        {#if showAuthBadge && !hasRun}
+        {#if showAuthBadge && !hasRun && agent !== "codex"}
+          <!-- Legacy composer auth badge (Claude only). The hero's AgentAuthBadge is the
+               canonical auth surface now; this is slated for removal post hero-migration and
+               is skipped for Codex (it would show wrong Anthropic/version data). -->
           <AuthSourceBadge
             {authOverview}
             {authSourceLabel}
@@ -2128,12 +2135,14 @@
             {localProxyStatuses}
           />
         {/if}
-        <SkillSelector
-          skills={skillItems}
-          {agents}
-          disabled={disabled || running}
-          onSelect={handleSkillSelect}
-        />
+        {#if agent !== "codex"}
+          <SkillSelector
+            skills={skillItems}
+            {agents}
+            disabled={disabled || running}
+            onSelect={handleSkillSelect}
+          />
+        {/if}
         {#if hasStash && onRestoreStash}
           <button
             class="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/15 text-violet-400 hover:bg-violet-500/25 transition-colors"

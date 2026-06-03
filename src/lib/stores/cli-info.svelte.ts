@@ -1,5 +1,5 @@
 import * as api from "$lib/api";
-import type { CliInfo, CliModelInfo, CliCommand } from "$lib/types";
+import type { CliInfo, CliModelInfo, CliCommand, CodexModelList } from "$lib/types";
 import { dbg, dbgWarn } from "$lib/utils/debug";
 
 let _info: CliInfo | null = $state(null);
@@ -40,6 +40,43 @@ export async function loadCliInfo(force = false): Promise<CliInfo | null> {
   return _info;
 }
 
+// ── Codex Models ──
+
+// Pulled live from `codex app-server` (model/list) — see api.getCodexModels.
+// No hardcoded list: new upstream models (e.g. gpt-5.5) appear without an app release.
+let _codex: CodexModelList | null = $state(null);
+let _codexLoading = false;
+let _codexLoaded = false;
+
+export function getCodexModels(): CliModelInfo[] {
+  return _codex?.models ?? [];
+}
+
+/** The model marked `isDefault` in the live Codex catalog, if known. */
+export function getCodexDefaultModel(): string | undefined {
+  return _codex?.defaultModel ?? undefined;
+}
+
+export async function loadCodexModels(force = false): Promise<CodexModelList | null> {
+  if (_codexLoaded && !force) return _codex;
+  if (_codexLoading) return _codex; // dedupe concurrent calls
+  _codexLoading = true;
+  try {
+    dbg("cli-info", "loading codex models", { force });
+    _codex = await api.getCodexModels(force);
+    _codexLoaded = true;
+    dbg("cli-info", "loaded codex models", {
+      models: _codex?.models.length,
+      default: _codex?.defaultModel,
+    });
+  } catch (e) {
+    dbgWarn("cli-info", "failed to load codex models", e);
+  } finally {
+    _codexLoading = false;
+  }
+  return _codex;
+}
+
 // ── CLI Version Info ──
 
 export interface CliVersionInfo {
@@ -51,6 +88,12 @@ export interface CliVersionInfo {
 
 let _versionInfo: CliVersionInfo | null = $state(null);
 let _versionLoading = $state(false);
+
+// ── Codex Version (global cache) ──
+let _codexVersion: string | null = $state(null);
+export function getCodexVersion(): string | null {
+  return _codexVersion;
+}
 
 export function getCliVersionInfo_cached(): CliVersionInfo | null {
   return _versionInfo;
@@ -73,11 +116,15 @@ export async function loadCliVersionInfo(): Promise<void> {
   _versionLoading = true;
   try {
     dbg("cli-info", "loadCliVersionInfo");
-    const [cliCheck, distTags, cliConfig] = await Promise.all([
+    const [cliCheck, codexCheck, distTags, cliConfig] = await Promise.all([
       api.checkAgentCli("claude").catch(() => null),
+      api.checkAgentCli("codex").catch(() => null),
       api.getCliDistTags().catch(() => ({ latest: undefined, stable: undefined })),
-      api.getCliConfig().catch(() => ({})),
+      api.getCliConfig().catch((): Record<string, unknown> => ({})),
     ]);
+
+    // Cache Codex version before Claude early return
+    _codexVersion = codexCheck?.version ?? null;
 
     if (!cliCheck?.found) {
       _versionInfo = null;
