@@ -2,7 +2,7 @@ use crate::agent::adapter::{self, ActorSessionMap};
 use crate::agent::claude_stream;
 use crate::agent::codex_appserver::CodexAppServer;
 use crate::agent::session_actor::{self, ActorCommand, AttachmentData, RalphCancelResult};
-use crate::agent::session_protocol::{SessionProtocol, StartupCtx};
+use crate::agent::session_protocol::{CodexSkillRef, SessionProtocol, StartupCtx};
 use crate::agent::spawn_locks::SpawnLocks;
 use crate::models::ConversationRef;
 use crate::models::{BusEvent, RemoteHost, RunMeta, RunStatus, SessionMode, UserSettings};
@@ -751,6 +751,7 @@ pub(crate) async fn start_session_impl(
             .send(ActorCommand::SendMessage {
                 text,
                 attachments: att_list,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -833,14 +834,17 @@ pub async fn send_session_message(
     run_id: String,
     message: String,
     attachments: Option<Vec<AttachmentData>>,
+    skills: Option<Vec<CodexSkillRef>>,
 ) -> Result<(), String> {
     // No SpawnLock — data operation, routed through actor channel
     let att_count = attachments.as_ref().map_or(0, |v| v.len());
+    let skill_count = skills.as_ref().map_or(0, |v| v.len());
     log::debug!(
-        "[session] send_session_message: run_id={}, msg_len={}, attachments={}",
+        "[session] send_session_message: run_id={}, msg_len={}, attachments={}, skills={}",
         run_id,
         message.len(),
-        att_count
+        att_count,
+        skill_count
     );
 
     // Get channel sender
@@ -852,6 +856,7 @@ pub async fn send_session_message(
         .send(ActorCommand::SendMessage {
             text: message.clone(),
             attachments: attachments.unwrap_or_default(),
+            skills: skills.unwrap_or_default(),
             reply: reply_tx,
         })
         .await
@@ -1445,6 +1450,7 @@ pub(crate) async fn approve_session_tool_impl(
         .send(ActorCommand::SendMessage {
             text: retry_msg,
             attachments: Vec::new(),
+            skills: Vec::new(),
             reply: reply_tx,
         })
         .await

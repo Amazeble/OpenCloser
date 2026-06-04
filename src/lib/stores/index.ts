@@ -27,5 +27,6 @@ export {
   getModelsForAgent,
   getCodexDefaultModel,
   loadCodexModels,
+  loadCodexModelsLive,
 } from "./cli-info.svelte";
 export type { CliVersionInfo } from "./cli-info.svelte";

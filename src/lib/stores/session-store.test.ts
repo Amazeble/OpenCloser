@@ -22,6 +22,7 @@ vi.mock("$lib/api", () => ({
   sendSessionControl: vi.fn(),
   steerSession: vi.fn(),
   syncCliSession: vi.fn().mockResolvedValue({ newEvents: 0 }),
+  renameRun: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock debug utils — they access localStorage which doesn't exist in node
@@ -59,6 +60,8 @@ import ralphLoopEvents from "./__fixtures__/ralph-loop.json";
 import scheduledTasksEvents from "./__fixtures__/scheduled-tasks.json";
 import malformedEvents from "./__fixtures__/malformed-events.json";
 import codexSimpleEvents from "./__fixtures__/codex-simple.json";
+import subagentAgentEvents from "./__fixtures__/subagent-agent.json";
+import codexCollabEvents from "./__fixtures__/codex-collab.json";
 
 // Import store and mocked modules after mocks
 import { SessionStore } from "./session-store.svelte";
@@ -1686,6 +1689,66 @@ describe("SessionStore reducer", () => {
       expect(taskEntry).toBeDefined();
       expect(taskEntry.tool.status).toBe("success");
       expect(taskEntry.tool.duration_ms).toBe(5000);
+    });
+  });
+
+  // ── Agent (Task→Agent rename) + Codex collab subagent shapes ──
+  // The reducer routes subagent children by parent_tool_use_id (tool-name agnostic), so the
+  // "Agent" rename and Codex collab runs must produce the same subTimeline + tool entries that
+  // InlineToolCard / ToolDetailView consume. These lock the entry shapes (not the rendered DOM —
+  // component-render tests aren't supported in this node-env vitest setup; assert on the data the
+  // components branch on instead: isSubagentTool, tool_use_result.toolStats, input.codexCollab).
+  describe("subagent rendering shapes", () => {
+    it("Agent (renamed) routes children to subTimeline and surfaces AgentOutput toolStats", () => {
+      store.run = makeRun("run-agent");
+      store.phase = "running";
+      store.applyEventBatch(subagentAgentEvents as BusEvent[]);
+
+      const mainTools = store.timeline.filter((e) => e.kind === "tool");
+      expect(mainTools).toHaveLength(1);
+      const agentEntry = mainTools[0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(agentEntry.tool.tool_name).toBe("Agent");
+      expect(agentEntry.tool.status).toBe("success");
+
+      // Child Bash routed into the parent Agent subTimeline, same as the legacy Task path.
+      expect(agentEntry.subTimeline).toBeDefined();
+      expect(agentEntry.subTimeline!).toHaveLength(2); // Bash tool + subagent message
+      const subBash = agentEntry.subTimeline![0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(subBash.tool.tool_name).toBe("Bash");
+
+      // ToolDetailView's taskResult derives from tool_use_result.totalToolUseCount; toolStats
+      // drives the per-category counts. Lock the shape the panel reads.
+      const result = agentEntry.tool.tool_use_result as Record<string, unknown>;
+      expect(result).toBeDefined();
+      expect(result.totalToolUseCount).toBe(1);
+      expect((result.toolStats as Record<string, unknown>).bashCount).toBe(1);
+      expect(result.agentType).toBe("Bash");
+    });
+
+    it("Codex collab run carries codexCollab marker on input and tool_use_result", () => {
+      store.run = makeRun("run-collab");
+      store.phase = "running";
+      store.applyEventBatch(codexCollabEvents as BusEvent[]);
+
+      const tools = store.timeline.filter((e) => e.kind === "tool");
+      expect(tools).toHaveLength(1);
+      const collab = tools[0] as Extract<TimelineEntry, { kind: "tool" }>;
+      expect(collab.tool.tool_name).toBe("Agent");
+      expect(collab.tool.status).toBe("success");
+
+      // ToolDetailView's codexCollab derived state prefers tool_use_result, falls back to input —
+      // both carry the marker so the collab shape renders in-flight and after completion.
+      const input = collab.tool.input as Record<string, unknown>;
+      expect(input.codexCollab).toBe(true);
+      expect(input.operation).toBe("spawnAgent");
+
+      const result = collab.tool.tool_use_result as Record<string, unknown>;
+      expect(result.codexCollab).toBe(true);
+      expect(result.operation).toBe("spawnAgent");
+      expect(result.status).toBe("completed");
+      const agents = result.agents as Array<Record<string, unknown>>;
+      expect(agents[0].thread_id).toBe("t2");
+      expect(agents[0].status).toBe("completed");
     });
   });
 
@@ -5974,6 +6037,7 @@ describe("sendMessage routing", () => {
       "codex-idle",
       "next task please",
       undefined,
+      undefined, // no skills
     );
     expect(api.steerSession).not.toHaveBeenCalled();
   });
@@ -5985,7 +6049,12 @@ describe("sendMessage routing", () => {
     await store.sendMessage("more detail", []);
 
     expect(api.steerSession).not.toHaveBeenCalled();
-    expect(api.sendSessionMessage).toHaveBeenCalledWith("claude-run", "more detail", undefined);
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "claude-run",
+      "more detail",
+      undefined,
+      undefined, // no skills
+    );
   });
 
   it("falls through to enqueue when a running Codex send carries attachments", async () => {
@@ -5999,6 +6068,37 @@ describe("sendMessage routing", () => {
     // turn/steer takes plain text only — attachments use the normal enqueue path.
     expect(api.steerSession).not.toHaveBeenCalled();
     expect(api.sendSessionMessage).toHaveBeenCalled();
+  });
+
+  it("forwards picked Codex skills to sendSessionMessage", async () => {
+    store.run = makeRun("codex-skill", { agent: "codex", status: "running" });
+    store.phase = "idle"; // sessionAlive but not running → enqueue path
+
+    const skills = [{ name: "find-bugs", path: "/abs/find-bugs/SKILL.md" }];
+    await store.sendMessage("scan this", [], skills);
+
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "codex-skill",
+      "scan this",
+      undefined,
+      skills,
+    );
+  });
+
+  it("does NOT steer a running Codex turn when skills are attached (skills need turn/start)", async () => {
+    store.run = makeRun("codex-skill-run", { agent: "codex", status: "running" });
+    store.phase = "running"; // running → would normally steer, but skills force enqueue
+
+    const skills = [{ name: "find-bugs", path: "/abs/find-bugs/SKILL.md" }];
+    await store.sendMessage("scan this", [], skills);
+
+    expect(api.steerSession).not.toHaveBeenCalled();
+    expect(api.sendSessionMessage).toHaveBeenCalledWith(
+      "codex-skill-run",
+      "scan this",
+      undefined,
+      skills,
+    );
   });
 });
 
@@ -6126,5 +6226,339 @@ describe("SessionStore — Codex Wave-3 (goal + rewind)", () => {
       expect(store.streamingText).toBe("");
       expect(store.thinkingText).toBe("");
     });
+  });
+});
+
+// ── Codex Wave-4: codex_hook_run reducer (hook lifecycle upsert) ──
+
+describe("SessionStore — Codex Wave-4 (hook lifecycle)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  function hookEntries() {
+    return store.timeline.filter((e) => e.kind === "hook") as Extract<
+      (typeof store.timeline)[number],
+      { kind: "hook" }
+    >[];
+  }
+
+  it("creates a running hook card on hook/started", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].hookId).toBe("hook-run-7");
+    expect(hooks[0].eventName).toBe("preToolUse");
+    expect(hooks[0].status).toBe("running");
+    // started carries no duration/message → optional fields stay unset.
+    expect(hooks[0].durationMs).toBeUndefined();
+    expect(hooks[0].statusMessage).toBeUndefined();
+  });
+
+  it("upserts: completed updates the SAME entry, not a second card", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+    const startedId = hookEntries()[0].id;
+
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-7",
+      event_name: "preToolUse",
+      status: "completed",
+      duration_ms: 1234,
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    // Still ONE card — keyed by hook_id, updated in place.
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].id).toBe(startedId);
+    expect(hooks[0].status).toBe("completed");
+    expect(hooks[0].durationMs).toBe(1234);
+  });
+
+  it("merges status_message on completion while keeping prior fields", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-8",
+      event_name: "permissionRequest",
+      status: "running",
+    } as BusEvent);
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-run-8",
+      event_name: "permissionRequest",
+      status: "blocked",
+      status_message: "denied by policy",
+      duration_ms: 42,
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].status).toBe("blocked");
+    expect(hooks[0].statusMessage).toBe("denied by policy");
+    expect(hooks[0].durationMs).toBe(42);
+    // eventName from the started event is preserved across the upsert.
+    expect(hooks[0].eventName).toBe("permissionRequest");
+  });
+
+  it("keeps distinct hook_ids as distinct cards", () => {
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-a",
+      event_name: "preToolUse",
+      status: "running",
+    } as BusEvent);
+    store.applyEvent({
+      type: "codex_hook_run",
+      run_id: "codex-w4",
+      hook_id: "hook-b",
+      event_name: "postToolUse",
+      status: "running",
+    } as BusEvent);
+
+    const hooks = hookEntries();
+    expect(hooks).toHaveLength(2);
+    expect(hooks.map((h) => h.hookId).sort()).toEqual(["hook-a", "hook-b"]);
+  });
+
+  it("is a known event type under strictMode (0 unknown, no throw)", () => {
+    // codex_hook_run must hit its reducer case, not the `default` unknown branch.
+    const strict = new SessionStore();
+    strict.strictMode = true;
+    strict.run = makeRun("codex-w4", { agent: "codex" });
+    strict.phase = "running";
+    expect(() =>
+      strict.applyEventBatch([
+        {
+          type: "codex_hook_run",
+          run_id: "codex-w4",
+          hook_id: "hook-strict",
+          event_name: "sessionStart",
+          status: "running",
+        },
+        {
+          type: "codex_hook_run",
+          run_id: "codex-w4",
+          hook_id: "hook-strict",
+          event_name: "sessionStart",
+          status: "completed",
+          duration_ms: 5,
+        },
+      ] as BusEvent[]),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+    expect(strict.rawFallbackCount).toBe(0);
+  });
+});
+
+// ── Codex Wave-4: codex_mcp_status reducer (live MCP startup-state) ──
+
+describe("SessionStore — Codex Wave-4 (MCP live status)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  it("maps Codex startup states to the panel vocab and upserts by name", () => {
+    // Unknown server → appended.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "starting",
+    } as BusEvent);
+    expect(store.mcpServers).toHaveLength(1);
+    expect(store.mcpServers[0]).toMatchObject({ name: "codex_apps", status: "pending" });
+
+    // Same name → updated in place (still one entry), ready → connected.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "ready",
+    } as BusEvent);
+    expect(store.mcpServers).toHaveLength(1);
+    expect(store.mcpServers[0].status).toBe("connected");
+
+    // failed carries the error through; cancelled also maps to failed.
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "failed",
+      error: "handshake failed",
+    } as BusEvent);
+    expect(store.mcpServers[0].status).toBe("failed");
+    expect(store.mcpServers[0].error).toBe("handshake failed");
+
+    store.applyEvent({
+      type: "codex_mcp_status",
+      run_id: "codex-w4",
+      name: "codex_apps",
+      status: "cancelled",
+    } as BusEvent);
+    expect(store.mcpServers[0].status).toBe("failed");
+  });
+
+  it("is a known event type (no unknown/raw fallback)", () => {
+    const strict = new SessionStore();
+    strict.run = makeRun("codex-w4", { agent: "codex" });
+    strict.strictMode = true;
+    expect(() =>
+      strict.applyEvent({
+        type: "codex_mcp_status",
+        run_id: "codex-w4",
+        name: "s1",
+        status: "ready",
+      } as BusEvent),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+  });
+});
+
+// ── Codex Wave-4 (G4): codex_turn_diff reducer (live aggregated turn diff) ──
+
+describe("SessionStore — Codex Wave-4 (turn diff live)", () => {
+  let store: SessionStore;
+
+  beforeEach(() => {
+    store = new SessionStore();
+    store.run = makeRun("codex-w4d", { agent: "codex" });
+    store.phase = "running";
+  });
+
+  it("stores the latest diff; a later event supersedes the earlier one", () => {
+    expect(store.turnDiff).toBe("");
+
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new");
+
+    // Cumulative push — later event wins (diff is aggregated server-side).
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "--- a\n+++ b\n@@ -1,2 +1,2 @@\n-old\n+new\n+extra",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("--- a\n+++ b\n@@ -1,2 +1,2 @@\n-old\n+new\n+extra");
+  });
+
+  it("clears the diff at the next turn start (run_state→running)", () => {
+    store.applyEvent({
+      type: "codex_turn_diff",
+      run_id: "codex-w4d",
+      turn_id: "tu1",
+      diff: "some diff",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("some diff");
+
+    // Next turn begins — the previous turn's aggregated diff is dropped.
+    store.applyEvent({
+      type: "run_state",
+      run_id: "codex-w4d",
+      state: "running",
+    } as BusEvent);
+    expect(store.turnDiff).toBe("");
+  });
+
+  it("is a known event type (no unknown/raw fallback)", () => {
+    const strict = new SessionStore();
+    strict.run = makeRun("codex-w4d", { agent: "codex" });
+    strict.strictMode = true;
+    expect(() =>
+      strict.applyEvent({
+        type: "codex_turn_diff",
+        run_id: "codex-w4d",
+        turn_id: "tu1",
+        diff: "d",
+      } as BusEvent),
+    ).not.toThrow();
+    expect(strict.unknownEventCount).toBe(0);
+  });
+});
+
+describe("SessionStart sessionTitle auto-naming", () => {
+  function sessionStartHook(runId: string, title: string | null): BusEvent {
+    return {
+      type: "hook_response",
+      run_id: runId,
+      hook_id: "h-sessiontitle",
+      hook_event: "SessionStart",
+      outcome: "success",
+      data: {},
+      stdout:
+        title === null
+          ? '{"hookSpecificOutput":{"hookEventName":"SessionStart"}}'
+          : `{"hookSpecificOutput":{"hookEventName":"SessionStart","sessionTitle":${JSON.stringify(title)}}}`,
+    } as BusEvent;
+  }
+
+  beforeEach(() => {
+    vi.mocked(api.renameRun).mockClear();
+  });
+
+  it("sets run.name from sessionTitle when the run has no name", async () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st1");
+    store.applyEvent(sessionStartHook("run-st1", "Refactor auth flow"));
+    expect(store.run?.name).toBe("Refactor auth flow");
+    await vi.waitFor(() =>
+      expect(api.renameRun).toHaveBeenCalledWith("run-st1", "Refactor auth flow"),
+    );
+  });
+
+  it("does NOT overwrite a user-assigned name (resume case)", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st2", { name: "My Custom Name" });
+    store.applyEvent(sessionStartHook("run-st2", "Hook Title"));
+    expect(store.run?.name).toBe("My Custom Name");
+    expect(api.renameRun).not.toHaveBeenCalled();
+  });
+
+  it("ignores a SessionStart hook with no sessionTitle", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st3");
+    store.applyEvent(sessionStartHook("run-st3", null));
+    expect(store.run?.name).toBeUndefined();
+    expect(api.renameRun).not.toHaveBeenCalled();
+  });
+
+  it("ignores sessionTitle from non-SessionStart hooks", () => {
+    const store = new SessionStore();
+    store.run = makeRun("run-st4");
+    store.applyEvent({
+      ...sessionStartHook("run-st4", "Should Be Ignored"),
+      hook_event: "PreToolUse",
+    } as BusEvent);
+    expect(store.run?.name).toBeUndefined();
+    expect(api.renameRun).not.toHaveBeenCalled();
   });
 });

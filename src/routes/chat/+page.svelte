@@ -15,6 +15,7 @@
     getModelsForAgent,
     getCodexDefaultModel,
     loadCodexModels,
+    loadCodexModelsLive,
     canResumeNow,
     TERMINAL_PHASES,
     getResumeWarning,
@@ -54,6 +55,8 @@
   import ToolBurstHeader from "$lib/components/ToolBurstHeader.svelte";
   import SessionStatusBar from "$lib/components/SessionStatusBar.svelte";
   import McpStatusPanel from "$lib/components/McpStatusPanel.svelte";
+  import FeaturesPanel from "$lib/components/FeaturesPanel.svelte";
+  import DiffModal from "$lib/components/DiffModal.svelte";
   import PromptInput from "$lib/components/PromptInput.svelte";
   import ScheduledTasksChip from "$lib/components/ScheduledTasksChip.svelte";
   import TodoPanel from "$lib/components/TodoPanel.svelte";
@@ -67,6 +70,7 @@
   import type { PromptInputSnapshot } from "$lib/types";
   import MarkdownContent from "$lib/components/MarkdownContent.svelte";
   import HookReviewCard from "$lib/components/HookReviewCard.svelte";
+  import HookExecutionCard from "$lib/components/HookExecutionCard.svelte";
   import ContextUsageGrid from "$lib/components/ContextUsageGrid.svelte";
   import CostSummaryView from "$lib/components/CostSummaryView.svelte";
   import { parseContextMarkdown } from "$lib/utils/context-parser";
@@ -183,6 +187,11 @@
   }
   /** Preloaded skill details from filesystem (has descriptions). */
   let preloadedSkills = $state<import("$lib/types").StandaloneSkill[]>([]);
+  /** Skills the live Codex agent actually loaded this session (name + path), from the app-server
+   *  `skills/list` runtime query. `path` is required to send a skill as a structured
+   *  {type:"skill"} UserInput. Empty unless there's a live Codex session — the composer skill
+   *  picker is gated on this being non-empty so we never offer a skill we can't actually send. */
+  let codexRuntimeSkills = $state<{ name: string; path: string; description: string }[]>([]);
   /** Preloaded agent definitions from filesystem. */
   let preloadedAgents = $state<import("$lib/types").AgentDefinitionSummary[]>([]);
   /** Project-level commands from {cwd}/.claude/commands/ + ~/.claude/commands/. */
@@ -468,6 +477,12 @@
 
   // ── MCP panel ──
   let mcpPanelOpen = $state(false);
+
+  // ── Codex features panel (experimentalFeature/list, live session only) ──
+  let featuresPanelOpen = $state(false);
+
+  // ── Codex turn diff (live aggregated diff for the current turn) ──
+  let turnDiffOpen = $state(false);
 
   // ── CLI session browser ──
 
@@ -1017,6 +1032,51 @@
       }));
     }
     return preloadedSkills.map((s) => ({ name: s.name, description: s.description }));
+  });
+
+  /** Race guard for the runtime skills query (run can switch mid-flight). */
+  let codexSkillsGen = 0;
+  /** Source the live Codex agent's loaded skills via app-server `skills/list`. Gated to a live
+   *  Codex session — no session means no process to ask, so we clear and the picker stays hidden
+   *  (avoids offering skills we can't send). Runs once per (runId, sessionAlive) transition. */
+  $effect(() => {
+    const runId = store.run?.id;
+    const live = effectiveAgent === "codex" && store.sessionAlive && !!runId;
+    if (!live) {
+      if (codexRuntimeSkills.length > 0) codexRuntimeSkills = [];
+      return;
+    }
+    const gen = ++codexSkillsGen;
+    dbg("skills", "fetch runtime skills", { runId });
+    api
+      .listCodexSkillsRuntime(runId!)
+      .then((res) => {
+        if (gen !== codexSkillsGen) return; // run/session changed while in flight
+        // Flatten every cwd entry's enabled skills; only enabled ones can actually trigger.
+        const flat = res.data.flatMap((entry) =>
+          entry.skills
+            .filter((s) => s.enabled)
+            .map((s) => ({
+              name: s.name,
+              path: s.path,
+              description: s.shortDescription ?? s.description ?? "",
+            })),
+        );
+        codexRuntimeSkills = flat;
+        dbg("skills", "runtime skills loaded", { count: flat.length });
+      })
+      .catch((e) => dbgWarn("skills", "listCodexSkillsRuntime failed", e));
+  });
+
+  /** Upgrade the Codex model catalog from the live app-server session (control `model_list`),
+   *  which is authoritative for the running CLI. Falls back to the pre-session catalog
+   *  (loadCodexModels) when no live session. Runs once per (runId, sessionAlive) transition. */
+  $effect(() => {
+    const runId = store.run?.id;
+    const live = effectiveAgent === "codex" && store.sessionAlive && !!runId;
+    if (!live) return;
+    dbg("models", "live session up, refreshing codex catalog", { runId });
+    void loadCodexModelsLive(runId!);
   });
 
   // ── Per-turn usage annotations in timeline ──
@@ -2051,7 +2111,13 @@
 
   // ── Send message ──
 
-  async function sendMessage(text: string, attachments: Attachment[]) {
+  async function sendMessage(
+    text: string,
+    attachments: Attachment[],
+    // Codex skill refs picked in the composer (live-Codex only). Forwarded to store.sendMessage,
+    // which threads them to the structured {type:"skill"} send. Empty for Claude / no-skill sends.
+    skills?: { name: string; path: string }[],
+  ) {
     if (!text.trim()) return;
 
     store.error = "";
@@ -2171,7 +2237,7 @@
         // sidebar afterward so its status badge leaves the stale "stopped" state.
         const wasStoppedCodex =
           store.useStreamSession && !store.sessionAlive && store.run?.agent === "codex";
-        await store.sendMessage(text, attachments);
+        await store.sendMessage(text, attachments, skills);
         if (wasStoppedCodex) window.dispatchEvent(new Event("ocv:runs-changed"));
         requestAnimationFrame(() => promptRef?.focus());
       }
@@ -4517,12 +4583,83 @@
           runId={store.run?.id ?? ""}
           mcpServers={store.mcpServers}
           sessionAlive={store.sessionAlive}
+          agent={effectiveAgent}
           onClose={() => (mcpPanelOpen = false)}
           onServersUpdate={(servers) => {
             store.updateMcpServers(servers);
           }}
         />
       </div>
+    {/if}
+
+    <!-- Codex turn diff pill (floating below status bar). Only Codex turns push an
+         aggregated diff; show the affordance once store.turnDiff is non-empty. -->
+    {#if effectiveAgent === "codex" && store.turnDiff.trim()}
+      <div class="absolute {statusBarExpanded ? 'top-16' : 'top-9'} right-3 z-30">
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-2.5 py-1 text-xs font-medium text-foreground shadow-sm backdrop-blur hover:bg-muted/60 transition-colors"
+          onclick={() => {
+            dbg("chat", "turn diff open", { len: store.turnDiff.length });
+            turnDiffOpen = true;
+          }}
+          title="View the aggregated diff for the current turn"
+        >
+          <svg
+            class="h-3.5 w-3.5 text-muted-foreground"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+          >
+            <path d="M9 3v18M3 9h18M3 15h18" />
+          </svg>
+          Turn diff
+        </button>
+      </div>
+    {/if}
+
+    <!-- Codex features pill + panel (floating below status bar). Live Codex session only —
+         experimentalFeature/list needs an app-server connection. Offset left of the turn-diff
+         pill (right-3) so the two affordances don't collide. -->
+    {#if effectiveAgent === "codex" && store.sessionAlive && store.run}
+      {@const featuresRight = store.turnDiff.trim() ? "right-28" : "right-3"}
+      <div class="absolute {statusBarExpanded ? 'top-16' : 'top-9'} {featuresRight} z-30">
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-2.5 py-1 text-xs font-medium text-foreground shadow-sm backdrop-blur hover:bg-muted/60 transition-colors {featuresPanelOpen
+            ? 'bg-muted/60'
+            : ''}"
+          onclick={() => {
+            featuresPanelOpen = !featuresPanelOpen;
+            dbg("features", "toggle panel", { open: featuresPanelOpen });
+          }}
+          title={t("features_title")}
+        >
+          <svg
+            class="h-3.5 w-3.5 text-muted-foreground"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1" />
+            <circle cx="12" cy="12" r="3.5" />
+          </svg>
+          {t("features_title")}
+        </button>
+      </div>
+      {#if featuresPanelOpen}
+        <div class="absolute {statusBarExpanded ? 'top-24' : 'top-16'} right-3 z-40">
+          <FeaturesPanel
+            runId={store.run.id}
+            sessionAlive={store.sessionAlive}
+            onClose={() => (featuresPanelOpen = false)}
+          />
+        </div>
+      {/if}
     {/if}
 
     <!-- Preview URL input bar -->
@@ -4928,6 +5065,13 @@
                           </div>
                         </div>
                       </div>
+                    {:else if entry.kind === "hook"}
+                      <HookExecutionCard
+                        eventName={entry.eventName}
+                        status={entry.status}
+                        statusMessage={entry.statusMessage}
+                        durationMs={entry.durationMs}
+                      />
                     {/if}
                   </div>
                 {/if}
@@ -5585,6 +5729,7 @@
         onShortcutHelp={() => (shortcutHelpOpen = !shortcutHelpOpen)}
         availableSkills={store.availableSkills}
         {skillItems}
+        codexSkillItems={codexRuntimeSkills}
         agents={preloadedAgents.map((a) => ({ name: a.name, description: a.description }))}
         hasStash={!!stashedInput}
         {userHistory}
@@ -5655,6 +5800,9 @@
   />
 
   <CodexReviewModal bind:open={codexReviewPickerOpen} onSubmit={runCodexReview} />
+
+  <!-- Codex turn diff: supplied-diff mode (no git fetch, no staged/unstaged tabs). -->
+  <DiffModal bind:open={turnDiffOpen} title="Turn diff" diffText={store.turnDiff} />
 
   <RewindCodexModal
     bind:open={codexRewindOpen}

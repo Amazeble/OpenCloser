@@ -1364,6 +1364,38 @@ pub enum BusEvent {
     /// timeUsedSeconds, createdAt, updatedAt}`) from the `thread/goal/updated` notification, or
     /// `Value::Null` when the goal was cleared (`thread/goal/cleared`). The GoalPanel renders it.
     GoalUpdate { run_id: String, goal: Value },
+    /// Codex hook lifecycle (`hook/started` → status "running", `hook/completed` → terminal
+    /// HookRunStatus). `hook_id` (= run.id) is stable across the pair so the frontend upserts a
+    /// single timeline card. `event_name` is the camelCase HookEventName (e.g. "preToolUse").
+    CodexHookRun {
+        run_id: String,
+        hook_id: String,
+        event_name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    /// Codex MCP server startup-state change (`mcpServer/startupStatus/updated`). Live push so the
+    /// MCP status panel updates without a manual refresh. `status` is the raw Codex
+    /// McpServerStartupState ("starting"|"ready"|"failed"|"cancelled"); the frontend maps it to the
+    /// panel vocabulary. Not replayed — ephemeral session state, like goal updates.
+    CodexMcpStatus {
+        run_id: String,
+        name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Codex turn-level aggregated unified diff (`turn/diff/updated`). `diff` is the cumulative
+    /// diff across all file changes in the turn; later pushes supersede earlier ones (latest
+    /// wins). Not replayed — ephemeral live state cleared at the next turn, like goal/mcp status.
+    CodexTurnDiff {
+        run_id: String,
+        turn_id: String,
+        diff: String,
+    },
     /// Tool use summary — top-level event type "tool_use_summary".
     ToolUseSummary {
         run_id: String,
@@ -1682,7 +1714,7 @@ impl Default for StandaloneSkill {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InstalledPlugin {
     #[serde(default, alias = "id")]
     pub name: String,

@@ -441,7 +441,7 @@ pub async fn dispatch_command(
             Ok(json!(true))
         }
         "list_codex_installed_plugins" => {
-            let result = crate::commands::plugins::list_codex_installed_plugins()?;
+            let result = crate::commands::plugins::list_codex_installed_plugins().await?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
         "toggle_codex_plugin" => {
@@ -971,6 +971,7 @@ pub async fn dispatch_command(
                 .send(ActorCommand::SendMessage {
                     text: message,
                     attachments,
+                    skills: Vec::new(),
                     reply: reply_tx,
                 })
                 .await
